@@ -71,10 +71,11 @@ export const USELESS_NOTICE = "[Uneventful result elided]";
 
 /**
  * Maps a tool call to a supersede key. Results sharing a key form a group in
- * which every result except the newest is a supersede candidate. A key `K`
- * additionally supersedes keys with prefix `K + "\u0000"` (selector-free read
- * supersedes selector-carrying reads of the same base path). Return
- * `undefined` to exempt a call from supersede grouping.
+ * which an older result is a supersede candidate once a newer successful result
+ * shows at least as much of it (see `collectSupersededResults`). A key `K` also
+ * covers keys with prefix `K + "\u0000"`: a complete selector-free read
+ * supersedes selector-carrying reads of the same base path. Return `undefined`
+ * to exempt a call from supersede grouping.
  */
 export type SupersedeKeyFn = (toolName: string, args: Record<string, unknown>) => string | undefined;
 
@@ -174,11 +175,83 @@ interface SupersedeCandidate {
 	notice: string;
 }
 
+/** Own property `key` of an untyped value; `undefined` when absent or not an object. */
+function prop(value: unknown, key: string): unknown {
+	if (typeof value !== "object" || value === null) return undefined;
+	return Object.getOwnPropertyDescriptor(value, key)?.value;
+}
+
+/** What a result shows: a view kind, plus the source lines shown for a partial page. */
+interface ResultView {
+	kind: string;
+	shown?: { start: number; end: number };
+}
+
+/** Kinds whose content is the whole file or selection, so any newer same-kind result covers them. */
+const WHOLE_VIEW_KINDS: ReadonlySet<string> = new Set(["complete", "summary", "notice"]);
+
+/** Read selectors that show a different form than a plain read: verbatim bytes, merge-conflict view. */
+const ALTERNATE_FORM_SELECTOR_RE = /raw|conflicts/i;
+
+/**
+ * What a result shows. Non-`read` results are `complete`. A `read` result is
+ * `summary`, a partial page (`truncated` / `column` / `unscanned` joined by `+`,
+ * with its `shownRange` when reported), `complete` only with positive proof (a
+ * scanned line count or a returned image), and otherwise `notice` (binary-file
+ * notice, directory listing).
+ */
+function resultView(toolName: string, message: ToolResultMessage): ResultView {
+	if (toolName !== "read") return { kind: "complete" };
+	const details: unknown = message.details;
+	if (prop(details, "summary") !== undefined) return { kind: "summary" };
+	const meta = prop(details, "meta");
+	const hasImage = message.content.some(block => block.type === "image");
+	const hasLineCount = typeof prop(details, "totalLines") === "number";
+	const partial = [
+		(prop(prop(details, "truncation"), "truncated") === true || prop(meta, "truncation") !== undefined) &&
+			"truncated",
+		prop(prop(meta, "limits"), "columnTruncated") !== undefined && "column",
+		// Unscanned local text reads carry a size but no exact line count.
+		typeof prop(details, "fileSize") === "number" && !hasLineCount && !hasImage && "unscanned",
+	]
+		.filter(Boolean)
+		.join("+");
+	if (partial) {
+		const shownRange = prop(prop(meta, "truncation"), "shownRange");
+		const start = prop(shownRange, "start");
+		const end = prop(shownRange, "end");
+		return typeof start === "number" && typeof end === "number"
+			? { kind: partial, shown: { start, end } }
+			: { kind: partial };
+	}
+	return { kind: hasLineCount || hasImage ? "complete" : "notice" };
+}
+
+/**
+ * Whether `newer` shows everything `older` showed for the same key: a complete
+ * result, a same-kind whole view, or a same-kind page whose shown lines contain
+ * the older page's. Pages without a reported range never cover.
+ */
+function coversView(newer: ResultView, older: ResultView): boolean {
+	if (newer.kind === "complete") return true;
+	if (newer.kind !== older.kind) return false;
+	if (WHOLE_VIEW_KINDS.has(older.kind)) return true;
+	return (
+		newer.shown !== undefined &&
+		older.shown !== undefined &&
+		newer.shown.start <= older.shown.start &&
+		newer.shown.end >= older.shown.end
+	);
+}
+
 /**
  * Collect superseded tool results: for every unpruned, unprotected tool result
- * whose paired call resolves a supersede key, a LATER result with the same key
- * — or with a key that is the `"\u0000"`-prefix parent of this one — marks it
- * superseded. Returned in message order.
+ * whose paired call resolves a supersede key, a LATER successful result marks it
+ * superseded only when that result covers it (see {@link coversView}). A
+ * `"\u0000"`-prefix parent (selector-free) read replaces selector reads only when
+ * complete and only for line-range selectors: `raw` and `conflicts` show a
+ * different form. Summaries, narrower pages, notices, and errors never erase
+ * earlier evidence.
  */
 function collectSupersededResults(
 	entries: readonly SessionEntry[],
@@ -188,7 +261,8 @@ function collectSupersededResults(
 	protectedTools: readonly ProtectedToolMatcher[],
 ): SupersedeCandidate[] {
 	const candidates: SupersedeCandidate[] = [];
-	const seenKeys = new Set<string>();
+	/** Supersede key → views of newer successful results. */
+	const newerViews = new Map<string, ResultView[]>();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		const message = getToolResultMessage(entry);
@@ -199,8 +273,19 @@ function collectSupersededResults(
 		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>);
 		if (key === undefined) continue;
 		const separator = key.indexOf("\u0000");
-		const superseded = seenKeys.has(key) || (separator >= 0 && seenKeys.has(key.slice(0, separator)));
-		seenKeys.add(key);
+		const sameKeyViews = newerViews.get(key);
+		const parentViews =
+			separator >= 0 && !(toolCall.name === "read" && ALTERNATE_FORM_SELECTOR_RE.test(key.slice(separator + 1)))
+				? newerViews.get(key.slice(0, separator))
+				: undefined;
+		const view = message.isError ? undefined : resultView(toolCall.name, message);
+		const superseded =
+			(sameKeyViews !== undefined && (view === undefined || sameKeyViews.some(newer => coversView(newer, view)))) ||
+			parentViews?.some(newer => newer.kind === "complete") === true;
+		if (view !== undefined) {
+			if (sameKeyViews) sameKeyViews.push(view);
+			else newerViews.set(key, [view]);
+		}
 		if (!superseded) continue;
 		candidates.push({
 			entry: entry as SessionMessageEntry,
@@ -427,8 +512,9 @@ export function pruneToolOutputs(
  * Internal/URL-scheme paths (`skill://…`, `https://…`) are exempt.
  * Selector-free reads key on the bare path; selector-carrying reads key on
  * `path + "\u0000" + selector`, so two reads collide only when the newer is
- * selector-free or the selectors are identical (the pass's prefix rule lets a
- * bare-path read supersede selector-carrying reads of the same file).
+ * selector-free or the selectors are identical. Whether a collision supersedes
+ * depends on what the newer read shows: only a complete bare-path read replaces
+ * selector-carrying reads of the same file.
  */
 export function readToolSupersedeKey(toolName: string, args: Record<string, unknown>): string | undefined {
 	if (toolName !== "read") return undefined;
